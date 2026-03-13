@@ -67,12 +67,19 @@ void initLayer(struct DroneLayer &L, const float *freqs, const float *lfoRates,
   }
 }
 
-float renderLayer(struct DroneLayer &L) {
+// Spectral tilt - very slow band gain modulation
+float bandPhase[3] = {0.0f, 0.33f, 0.67f};
+const float bandRate[3] = {0.005f, 0.007f, 0.009f};
+const float bandMin[3] = {0.3f, 0.4f, 0.3f};
+const float bandMax[3] = {1.0f, 1.0f, 1.0f};
+float bandGain[3] = {1.0f, 0.6f, 0.5f};
+
+float renderLayer(struct DroneLayer &L, const int *bandMap) {
   float mix = 0;
   for (int i = 0; i < L.numOsc; i++) {
     Osc &o = L.oscs[i];
     float lfo = 1.0f - o.lfoDepth * 0.5f + o.lfoDepth * 0.5f * fastSin(o.lfoPhase);
-    mix += fastSin(o.phase) * o.amp * lfo;
+    mix += fastSin(o.phase) * o.amp * lfo * bandGain[bandMap[i]];
     o.phase += o.freq / SAMPLE_RATE;
     if (o.phase >= 1.0f) o.phase -= 1.0f;
     o.lfoPhase += o.lfoRate / SAMPLE_RATE;
@@ -80,6 +87,10 @@ float renderLayer(struct DroneLayer &L) {
   }
   return mix * L.volume;
 }
+
+// Which band each oscillator belongs to (0=bass, 1=mid, 2=high)
+const int bandMapA[] = {0, 0, 1, 1, 2, 2, 2, 2};  // Layer A
+const int bandMapB[] = {1, 1, 2, 2, 2, 2, 2, 2};  // Layer B (no bass)
 
 void morphLayer(struct DroneLayer &L) {
   L.morphPos += L.morphSpeed * BUFFER_SIZE;
@@ -98,8 +109,8 @@ void morphLayer(struct DroneLayer &L) {
 // === LAYER A: Root drone (55Hz fundamental) ===
 DroneLayer layerA;
 const float freqsA[] = {55, 110, 165, 220, 660, 880, 1100, 1320};
-const float lfoRatesA[] = {0.07, 0.11, 0.13, 0.17, 0.23, 0.29, 0.31, 0.37};
-const float lfoDepthsA[] = {0.08, 0.12, 0.15, 0.18, 0.4, 0.5, 0.5, 0.5};
+const float lfoRatesA[] = {0.03, 0.05, 0.07, 0.09, 0.13, 0.17, 0.19, 0.23};
+const float lfoDepthsA[] = {0.06, 0.08, 0.10, 0.12, 0.3, 0.4, 0.4, 0.4};
 const Scene scenesA[] = {
   {{1.0, 0.50, 0.30, 0.15, 0.00, 0.03, 0.02, 0.00}},
   {{1.0, 0.55, 0.25, 0.20, 0.00, 0.02, 0.00, 0.03}},
@@ -112,11 +123,12 @@ const Scene scenesA[] = {
 };
 
 // === LAYER B: Ethereal shimmer (220Hz base, octaves above root) ===
-// Slightly detuned for gentle beating against layer A's harmonics
+// Slightly detuned for very gentle beating against layer A's harmonics
+// 220.05Hz = 0.05Hz beat with layer A's 220Hz = ~20 second cycle
 DroneLayer layerB;
-const float freqsB[] = {220.3, 440.6, 661, 881, 1101, 1322, 1762, 2202};
-const float lfoRatesB[] = {0.05, 0.09, 0.14, 0.19, 0.27, 0.33, 0.39, 0.41};
-const float lfoDepthsB[] = {0.25, 0.30, 0.35, 0.40, 0.50, 0.55, 0.55, 0.55};
+const float freqsB[] = {220.05, 440.1, 660.15, 880.2, 1100.25, 1320.3, 1760.4, 2200.5};
+const float lfoRatesB[] = {0.025, 0.04, 0.06, 0.08, 0.11, 0.15, 0.18, 0.21};
+const float lfoDepthsB[] = {0.15, 0.20, 0.25, 0.30, 0.40, 0.45, 0.45, 0.45};
 const Scene scenesB[] = {
   {{0.5, 0.25, 0.15, 0.10, 0.06, 0.04, 0.02, 0.01}},
   {{0.4, 0.30, 0.10, 0.12, 0.04, 0.06, 0.01, 0.02}},
@@ -162,13 +174,13 @@ void setup() {
   buildSineTable();
 
   // Layer A: root drone at 55Hz, morphs slowly
-  initLayer(layerA, freqsA, lfoRatesA, lfoDepthsA, 8, 0.30f, 0.00001f);
+  initLayer(layerA, freqsA, lfoRatesA, lfoDepthsA, 8, 0.30f, 0.000005f);
   layerA.numScenes = 8;
   memcpy(layerA.scenes, scenesA, sizeof(scenesA));
   for (int i = 0; i < 8; i++) layerA.oscs[i].amp = scenesA[0].amps[i];
 
   // Layer B: ethereal shimmer at 220Hz, quieter, slower morph
-  initLayer(layerB, freqsB, lfoRatesB, lfoDepthsB, 8, 0.12f, 0.000006f);
+  initLayer(layerB, freqsB, lfoRatesB, lfoDepthsB, 8, 0.12f, 0.000003f);
   layerB.numScenes = 6;
   memcpy(layerB.scenes, scenesB, sizeof(scenesB));
   for (int i = 0; i < 8; i++) layerB.oscs[i].amp = scenesB[0].amps[i];
@@ -181,13 +193,15 @@ void loop() {
   unsigned long t0 = micros();
 
   for (int s = 0; s < BUFFER_SIZE; s++) {
-    float mix = renderLayer(layerA) + renderLayer(layerB);
+    float mix = renderLayer(layerA, bandMapA) + renderLayer(layerB, bandMapB);
 
-    // Soft clip
+    // Soft clip with tanh-like curve
+    if (mix > 0.8f) mix = 0.8f + 0.2f * tanhf((mix - 0.8f) * 5.0f);
+    if (mix < -0.8f) mix = -0.8f + 0.2f * tanhf((mix + 0.8f) * 5.0f);
     if (mix > 1.0f) mix = 1.0f;
     if (mix < -1.0f) mix = -1.0f;
 
-    int16_t val = (int16_t)(mix * 14000.0f);
+    int16_t val = (int16_t)(mix * 10000.0f);
     outBuf[s * 2] = val;
     outBuf[s * 2 + 1] = val;
   }
@@ -201,6 +215,14 @@ void loop() {
 
   morphLayer(layerA);
   morphLayer(layerB);
+
+  // Update spectral tilt - very slow band gain sweep
+  for (int b = 0; b < 3; b++) {
+    bandPhase[b] += bandRate[b] / SAMPLE_RATE * BUFFER_SIZE;
+    if (bandPhase[b] >= 1.0f) bandPhase[b] -= 1.0f;
+    float s = fastSin(bandPhase[b]);  // -1..1
+    bandGain[b] = bandMin[b] + (bandMax[b] - bandMin[b]) * (s * 0.5f + 0.5f);
+  }
 
   // Report CPU usage every 5 seconds
   if (millis() - lastReport > 5000) {
