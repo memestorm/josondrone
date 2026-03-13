@@ -138,6 +138,56 @@ const Scene scenesB[] = {
   {{0.4, 0.28, 0.14, 0.12, 0.04, 0.04, 0.01, 0.03}},
 };
 
+// === REVERB: 4 comb filters + 2 allpass filters ===
+// Prime-length delays to avoid metallic resonances
+#define NUM_COMBS 4
+#define NUM_ALLPASS 2
+
+const int combLens[NUM_COMBS] = {1687, 1931, 2143, 2473};  // ~38-56ms
+const float combFB[NUM_COMBS] = {0.84f, 0.82f, 0.80f, 0.78f};
+
+const int apLens[NUM_ALLPASS] = {347, 521};  // ~8-12ms
+const float apFB = 0.5f;
+
+// Delay buffers
+float combBuf[NUM_COMBS][2500];  // max comb length
+float apBuf[NUM_ALLPASS][600];   // max allpass length
+int combIdx[NUM_COMBS] = {0};
+int apIdx[NUM_ALLPASS] = {0};
+
+// Low-pass filter state per comb (darkens reverb tail)
+float combLP[NUM_COMBS] = {0};
+const float lpCoeff = 0.4f;  // lower = darker tail
+
+float reverbMix = 0.25f;  // wet/dry mix
+
+float processReverb(float input) {
+  float combOut = 0;
+
+  // Parallel comb filters with LP in feedback
+  for (int c = 0; c < NUM_COMBS; c++) {
+    float delayed = combBuf[c][combIdx[c]];
+    // One-pole low-pass in feedback path
+    combLP[c] = combLP[c] + lpCoeff * (delayed - combLP[c]);
+    combBuf[c][combIdx[c]] = input + combLP[c] * combFB[c];
+    combIdx[c] = (combIdx[c] + 1) % combLens[c];
+    combOut += delayed;
+  }
+  combOut *= 0.25f;  // average the 4 combs
+
+  // Series allpass filters (add diffusion)
+  float ap = combOut;
+  for (int a = 0; a < NUM_ALLPASS; a++) {
+    float delayed = apBuf[a][apIdx[a]];
+    float temp = -ap * apFB + delayed;
+    apBuf[a][apIdx[a]] = ap + delayed * apFB;
+    apIdx[a] = (apIdx[a] + 1) % apLens[a];
+    ap = temp;
+  }
+
+  return ap;
+}
+
 int16_t outBuf[BUFFER_SIZE * 2];
 
 // CPU measurement
@@ -185,15 +235,21 @@ void setup() {
   memcpy(layerB.scenes, scenesB, sizeof(scenesB));
   for (int i = 0; i < 8; i++) layerB.oscs[i].amp = scenesB[0].amps[i];
 
+  // Clear reverb buffers
+  memset(combBuf, 0, sizeof(combBuf));
+  memset(apBuf, 0, sizeof(apBuf));
+
   setupI2S();
-  Serial.println("Dual drone playing!");
+  Serial.println("Dual drone + reverb playing!");
 }
 
 void loop() {
   unsigned long t0 = micros();
 
   for (int s = 0; s < BUFFER_SIZE; s++) {
-    float mix = renderLayer(layerA, bandMapA) + renderLayer(layerB, bandMapB);
+    float dry = renderLayer(layerA, bandMapA) + renderLayer(layerB, bandMapB);
+    float wet = processReverb(dry);
+    float mix = dry + wet * reverbMix;
 
     // Soft clip with tanh-like curve
     if (mix > 0.8f) mix = 0.8f + 0.2f * tanhf((mix - 0.8f) * 5.0f);
