@@ -1,7 +1,6 @@
 #include <driver/i2s.h>
 #include <math.h>
 
-// I2S pins matching our wiring
 #define I2S_BCK  26
 #define I2S_WS   33
 #define I2S_DOUT 25
@@ -10,17 +9,15 @@
 #define BUFFER_SIZE 512
 #define TWO_PI 6.28318530718f
 
-// Sine wavetable - 1024 entries for smooth interpolation
+// Sine wavetable
 #define TABLE_SIZE 1024
 static float sinTable[TABLE_SIZE];
 
 void buildSineTable() {
-  for (int i = 0; i < TABLE_SIZE; i++) {
+  for (int i = 0; i < TABLE_SIZE; i++)
     sinTable[i] = sinf(TWO_PI * i / TABLE_SIZE);
-  }
 }
 
-// Fast sine lookup with linear interpolation
 inline float fastSin(float phase) {
   float idx = phase * TABLE_SIZE;
   int i = (int)idx;
@@ -30,59 +27,111 @@ inline float fastSin(float phase) {
   return sinTable[i] + frac * (sinTable[j] - sinTable[i]);
 }
 
-// Oscillator with phase accumulator
+// --- Drone Layer ---
+#define MAX_OSC 8
+#define MAX_SCENES 8
+
 struct Osc {
-  float phase;     // 0..1
-  float freq;      // Hz
-  float amp;       // current amplitude
-  float targetAmp; // amplitude we're morphing toward
-  float lfoPhase;  // per-osc LFO phase
-  float lfoRate;   // LFO speed (Hz)
-  float lfoDepth;  // 0..1 how much LFO affects amplitude
+  float phase, freq, amp, lfoPhase, lfoRate, lfoDepth;
 };
 
-#define NUM_OSC 8
-Osc oscs[NUM_OSC];
-
-// Scene definitions: 8 harmonics x 8 scenes
-// {freq, amp} pairs per scene
 struct Scene {
-  float amps[NUM_OSC]; // amplitude for each oscillator
+  float amps[MAX_OSC];
 };
 
-// Oscillator frequencies (all multiples of 55Hz)
-const float oscFreqs[NUM_OSC] = {
-  55.0f, 110.0f, 165.0f, 220.0f, 660.0f, 880.0f, 1100.0f, 1320.0f
+struct DroneLayer {
+  Osc oscs[MAX_OSC];
+  int numOsc;
+  Scene scenes[MAX_SCENES];
+  int numScenes;
+  int curScene, nxtScene;
+  float morphPos, morphSpeed;
+  float volume;  // overall layer volume
 };
 
-// LFO rates per oscillator (different rates = phasing)
-const float lfoRates[NUM_OSC] = {
-  0.07f, 0.11f, 0.13f, 0.17f, 0.23f, 0.29f, 0.31f, 0.37f
+void initLayer(struct DroneLayer &L, const float *freqs, const float *lfoRates,
+               const float *lfoDepths, int nOsc, float vol, float morphSpd) {
+  L.numOsc = nOsc;
+  L.curScene = 0;
+  L.nxtScene = 1;
+  L.morphPos = 0;
+  L.morphSpeed = morphSpd;
+  L.volume = vol;
+  for (int i = 0; i < nOsc; i++) {
+    L.oscs[i].phase = 0;
+    L.oscs[i].freq = freqs[i];
+    L.oscs[i].amp = 0;
+    L.oscs[i].lfoPhase = (float)i / nOsc;
+    L.oscs[i].lfoRate = lfoRates[i];
+    L.oscs[i].lfoDepth = lfoDepths[i];
+  }
+}
+
+float renderLayer(struct DroneLayer &L) {
+  float mix = 0;
+  for (int i = 0; i < L.numOsc; i++) {
+    Osc &o = L.oscs[i];
+    float lfo = 1.0f - o.lfoDepth * 0.5f + o.lfoDepth * 0.5f * fastSin(o.lfoPhase);
+    mix += fastSin(o.phase) * o.amp * lfo;
+    o.phase += o.freq / SAMPLE_RATE;
+    if (o.phase >= 1.0f) o.phase -= 1.0f;
+    o.lfoPhase += o.lfoRate / SAMPLE_RATE;
+    if (o.lfoPhase >= 1.0f) o.lfoPhase -= 1.0f;
+  }
+  return mix * L.volume;
+}
+
+void morphLayer(struct DroneLayer &L) {
+  L.morphPos += L.morphSpeed * BUFFER_SIZE;
+  if (L.morphPos >= 1.0f) {
+    L.morphPos = 0;
+    L.curScene = L.nxtScene;
+    L.nxtScene = (L.nxtScene + 1) % L.numScenes;
+  }
+  for (int i = 0; i < L.numOsc; i++) {
+    float a = L.scenes[L.curScene].amps[i];
+    float b = L.scenes[L.nxtScene].amps[i];
+    L.oscs[i].amp = a + (b - a) * L.morphPos;
+  }
+}
+
+// === LAYER A: Root drone (55Hz fundamental) ===
+DroneLayer layerA;
+const float freqsA[] = {55, 110, 165, 220, 660, 880, 1100, 1320};
+const float lfoRatesA[] = {0.07, 0.11, 0.13, 0.17, 0.23, 0.29, 0.31, 0.37};
+const float lfoDepthsA[] = {0.08, 0.12, 0.15, 0.18, 0.4, 0.5, 0.5, 0.5};
+const Scene scenesA[] = {
+  {{1.0, 0.50, 0.30, 0.15, 0.00, 0.03, 0.02, 0.00}},
+  {{1.0, 0.55, 0.25, 0.20, 0.00, 0.02, 0.00, 0.03}},
+  {{1.0, 0.60, 0.20, 0.25, 0.00, 0.00, 0.01, 0.00}},
+  {{1.0, 0.65, 0.15, 0.30, 0.03, 0.00, 0.00, 0.02}},
+  {{1.0, 0.60, 0.20, 0.25, 0.02, 0.00, 0.03, 0.00}},
+  {{1.0, 0.55, 0.25, 0.20, 0.00, 0.03, 0.00, 0.02}},
+  {{1.0, 0.50, 0.30, 0.15, 0.00, 0.00, 0.02, 0.02}},
+  {{1.0, 0.45, 0.35, 0.10, 0.02, 0.03, 0.00, 0.00}},
 };
 
-// LFO depths per oscillator (higher harmonics modulate more)
-const float lfoDepths[NUM_OSC] = {
-  0.08f, 0.12f, 0.15f, 0.18f, 0.4f, 0.5f, 0.5f, 0.5f
+// === LAYER B: Ethereal shimmer (220Hz base, octaves above root) ===
+// Slightly detuned for gentle beating against layer A's harmonics
+DroneLayer layerB;
+const float freqsB[] = {220.3, 440.6, 661, 881, 1101, 1322, 1762, 2202};
+const float lfoRatesB[] = {0.05, 0.09, 0.14, 0.19, 0.27, 0.33, 0.39, 0.41};
+const float lfoDepthsB[] = {0.25, 0.30, 0.35, 0.40, 0.50, 0.55, 0.55, 0.55};
+const Scene scenesB[] = {
+  {{0.5, 0.25, 0.15, 0.10, 0.06, 0.04, 0.02, 0.01}},
+  {{0.4, 0.30, 0.10, 0.12, 0.04, 0.06, 0.01, 0.02}},
+  {{0.5, 0.20, 0.18, 0.08, 0.05, 0.03, 0.03, 0.01}},
+  {{0.3, 0.35, 0.12, 0.15, 0.03, 0.05, 0.02, 0.02}},
+  {{0.5, 0.25, 0.15, 0.10, 0.06, 0.02, 0.03, 0.01}},
+  {{0.4, 0.28, 0.14, 0.12, 0.04, 0.04, 0.01, 0.03}},
 };
 
-const Scene scenes[] = {
-  {{1.0f, 0.50f, 0.30f, 0.15f, 0.00f, 0.03f, 0.02f, 0.00f}},
-  {{1.0f, 0.55f, 0.25f, 0.20f, 0.00f, 0.02f, 0.00f, 0.03f}},
-  {{1.0f, 0.60f, 0.20f, 0.25f, 0.00f, 0.00f, 0.01f, 0.00f}},
-  {{1.0f, 0.65f, 0.15f, 0.30f, 0.03f, 0.00f, 0.00f, 0.02f}},
-  {{1.0f, 0.60f, 0.20f, 0.25f, 0.02f, 0.00f, 0.03f, 0.00f}},
-  {{1.0f, 0.55f, 0.25f, 0.20f, 0.00f, 0.03f, 0.00f, 0.02f}},
-  {{1.0f, 0.50f, 0.30f, 0.15f, 0.00f, 0.00f, 0.02f, 0.02f}},
-  {{1.0f, 0.45f, 0.35f, 0.10f, 0.02f, 0.03f, 0.00f, 0.00f}},
-};
-const int NUM_SCENES = sizeof(scenes) / sizeof(scenes[0]);
+int16_t outBuf[BUFFER_SIZE * 2];
 
-int currentScene = 0;
-int nextScene = 1;
-float morphProgress = 0.0f;       // 0..1
-float morphSpeed = 0.00001f;      // very slow morph
-
-int16_t outBuf[BUFFER_SIZE * 2]; // stereo interleaved
+// CPU measurement
+unsigned long lastReport = 0;
+unsigned long renderUs = 0;
+int bufCount = 0;
 
 void setupI2S() {
   i2s_config_t config = {
@@ -97,14 +146,12 @@ void setupI2S() {
     .use_apll = false,
     .tx_desc_auto_clear = true,
   };
-
   i2s_pin_config_t pins = {
     .bck_io_num = I2S_BCK,
     .ws_io_num = I2S_WS,
     .data_out_num = I2S_DOUT,
     .data_in_num = I2S_PIN_NO_CHANGE,
   };
-
   i2s_driver_install(I2S_NUM_0, &config, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pins);
   i2s_zero_dma_buffer(I2S_NUM_0);
@@ -112,79 +159,59 @@ void setupI2S() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Building sine table...");
   buildSineTable();
 
-  // Init oscillators
-  for (int i = 0; i < NUM_OSC; i++) {
-    oscs[i].phase = 0.0f;
-    oscs[i].freq = oscFreqs[i];
-    oscs[i].amp = scenes[0].amps[i];
-    oscs[i].targetAmp = scenes[0].amps[i];
-    oscs[i].lfoPhase = (float)i / NUM_OSC; // spread LFO phases
-    oscs[i].lfoRate = lfoRates[i];
-    oscs[i].lfoDepth = lfoDepths[i];
-  }
+  // Layer A: root drone at 55Hz, morphs slowly
+  initLayer(layerA, freqsA, lfoRatesA, lfoDepthsA, 8, 0.30f, 0.00001f);
+  layerA.numScenes = 8;
+  memcpy(layerA.scenes, scenesA, sizeof(scenesA));
+  for (int i = 0; i < 8; i++) layerA.oscs[i].amp = scenesA[0].amps[i];
 
-  Serial.println("Starting I2S...");
+  // Layer B: ethereal shimmer at 220Hz, quieter, slower morph
+  initLayer(layerB, freqsB, lfoRatesB, lfoDepthsB, 8, 0.12f, 0.000006f);
+  layerB.numScenes = 6;
+  memcpy(layerB.scenes, scenesB, sizeof(scenesB));
+  for (int i = 0; i < 8; i++) layerB.oscs[i].amp = scenesB[0].amps[i];
+
   setupI2S();
-  Serial.println("Playing drone!");
+  Serial.println("Dual drone playing!");
 }
 
 void loop() {
-  float phaseInc[NUM_OSC];
-  float lfoInc[NUM_OSC];
+  unsigned long t0 = micros();
 
-  for (int i = 0; i < NUM_OSC; i++) {
-    phaseInc[i] = oscs[i].freq / SAMPLE_RATE;
-    lfoInc[i] = oscs[i].lfoRate / SAMPLE_RATE;
-  }
-
-  // Fill buffer
   for (int s = 0; s < BUFFER_SIZE; s++) {
-    float mix = 0.0f;
+    float mix = renderLayer(layerA) + renderLayer(layerB);
 
-    for (int i = 0; i < NUM_OSC; i++) {
-      // LFO modulates amplitude
-      float lfo = 1.0f - oscs[i].lfoDepth * 0.5f
-                  + oscs[i].lfoDepth * 0.5f * fastSin(oscs[i].lfoPhase);
-
-      float sample = fastSin(oscs[i].phase) * oscs[i].amp * lfo;
-      mix += sample;
-
-      oscs[i].phase += phaseInc[i];
-      if (oscs[i].phase >= 1.0f) oscs[i].phase -= 1.0f;
-
-      oscs[i].lfoPhase += lfoInc[i];
-      if (oscs[i].lfoPhase >= 1.0f) oscs[i].lfoPhase -= 1.0f;
-    }
-
-    // Soft clip and scale
-    mix *= 0.35f;
+    // Soft clip
     if (mix > 1.0f) mix = 1.0f;
     if (mix < -1.0f) mix = -1.0f;
 
-    int16_t val = (int16_t)(mix * 12000.0f);
-    outBuf[s * 2] = val;      // left
-    outBuf[s * 2 + 1] = val;  // right
+    int16_t val = (int16_t)(mix * 14000.0f);
+    outBuf[s * 2] = val;
+    outBuf[s * 2 + 1] = val;
   }
 
-  // Write to I2S
+  unsigned long t1 = micros();
+  renderUs += (t1 - t0);
+  bufCount++;
+
   size_t written;
   i2s_write(I2S_NUM_0, outBuf, sizeof(outBuf), &written, portMAX_DELAY);
 
-  // Slowly morph between scenes
-  morphProgress += morphSpeed * BUFFER_SIZE;
-  if (morphProgress >= 1.0f) {
-    morphProgress = 0.0f;
-    currentScene = nextScene;
-    nextScene = (nextScene + 1) % NUM_SCENES;
-  }
+  morphLayer(layerA);
+  morphLayer(layerB);
 
-  // Interpolate target amplitudes
-  for (int i = 0; i < NUM_OSC; i++) {
-    float a = scenes[currentScene].amps[i];
-    float b = scenes[nextScene].amps[i];
-    oscs[i].amp = a + (b - a) * morphProgress;
+  // Report CPU usage every 5 seconds
+  if (millis() - lastReport > 5000) {
+    // Time available per buffer: BUFFER_SIZE / SAMPLE_RATE seconds
+    float availUs = (float)BUFFER_SIZE / SAMPLE_RATE * 1000000.0f;
+    float avgUs = (float)renderUs / bufCount;
+    float cpuPct = avgUs / availUs * 100.0f;
+    Serial.printf("CPU: %.1f%% (%d us avg, %d us avail per buf)\n",
+                  cpuPct, (int)avgUs, (int)availUs);
+    renderUs = 0;
+    bufCount = 0;
+    lastReport = millis();
   }
 }
