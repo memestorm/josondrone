@@ -24,12 +24,16 @@ An ambient meditation drone synthesizer running on an ESP32 microcontroller with
 
 ### PCM5102 Solder Bridges (on back of breakout)
 
+The breakout board used has these factory-default bridge settings (unmodified):
+
 | Pad | Setting | Function |
 |-----|---------|----------|
 | H1L (FLT) | L | Normal latency filter |
 | H2L (DEMP) | L | De-emphasis off |
-| H3L (XSMT) | **H** | **Soft mute disabled — critical, DAC is silent if set to L** |
+| H3L (XSMT) | H | Soft mute disabled (DAC will be silent if this is set to L) |
 | H4L (FMT) | L | I2S format |
+
+**Note:** If your PCM5102 breakout has no sound, check H3L — it must be bridged to H. Many breakouts ship this way by default, but some don't.
 
 ## Flashing
 
