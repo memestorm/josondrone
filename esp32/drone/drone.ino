@@ -112,6 +112,17 @@ void morphLayer(struct DroneLayer &L) {
   }
 }
 
+// === Tuning drift: slowly evolve between A440 (55Hz) and Verdi A432 (54Hz) ===
+const float tuneA440 = 55.0f;
+const float tuneVerdi = 54.0f;  // 432/8
+float tunePhase = 0;
+const float tuneRate = 0.004f;  // Hz — full cycle ~250 seconds (~4 min round trip)
+
+// Base frequency ratios (relative to fundamental) for retuning
+const float ratiosA[] = {1, 2, 3, 4, 12, 16, 20, 24};  // 55, 110, 165, 220, 660, 880, 1100, 1320
+const float ratiosB[] = {4.0009f, 8.0018f, 12.0027f, 16.0036f, 20.0045f, 24.0055f, 32.0073f, 40.0091f};
+// Layer B ratios include the slight detuning: 220.05/55 = 4.0009 etc.
+
 // === LAYER A: Root drone (55Hz fundamental) ===
 DroneLayer layerA;
 const float freqsA[] = {55, 110, 165, 220, 660, 880, 1100, 1320};
@@ -402,6 +413,16 @@ void loop() {
     if (bandPhase[b] >= 1.0f) bandPhase[b] -= 1.0f;
     float s = fastSin(bandPhase[b]);  // -1..1
     bandGain[b] = bandMin[b] + (bandMax[b] - bandMin[b]) * (s * 0.5f + 0.5f);
+  }
+
+  // Update tuning drift: slowly morph between A440 and Verdi A432
+  tunePhase += tuneRate / SAMPLE_RATE * BUFFER_SIZE;
+  if (tunePhase >= 1.0f) tunePhase -= 1.0f;
+  float tuneMix = fastSin(tunePhase) * 0.5f + 0.5f;  // 0..1
+  float baseFreq = tuneA440 + (tuneVerdi - tuneA440) * tuneMix;
+  for (int i = 0; i < 8; i++) {
+    layerA.oscs[i].freq = baseFreq * ratiosA[i];
+    layerB.oscs[i].freq = baseFreq * ratiosB[i];
   }
 
   // Report CPU usage every 5 seconds
