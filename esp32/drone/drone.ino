@@ -74,7 +74,11 @@ const float bandMin[3] = {0.3f, 0.4f, 0.3f};
 const float bandMax[3] = {1.0f, 1.0f, 1.0f};
 float bandGain[3] = {1.0f, 0.6f, 0.5f};
 
-float renderLayer(struct DroneLayer &L, const int *bandMap) {
+// Binaural beat: single oscillator that creates L/R difference
+float binauralPhase = 0;
+const float binauralFreq = 6.0f;  // Hz — theta range
+
+void renderLayerStereo(struct DroneLayer &L, const int *bandMap, float &outL, float &outR) {
   float mix = 0;
   for (int i = 0; i < L.numOsc; i++) {
     Osc &o = L.oscs[i];
@@ -85,7 +89,9 @@ float renderLayer(struct DroneLayer &L, const int *bandMap) {
     o.lfoPhase += o.lfoRate / SAMPLE_RATE;
     if (o.lfoPhase >= 1.0f) o.lfoPhase -= 1.0f;
   }
-  return mix * L.volume;
+  float m = mix * L.volume;
+  outL += m;
+  outR += m;
 }
 
 // Which band each oscillator belongs to (0=bass, 1=mid, 2=high)
@@ -330,7 +336,7 @@ void setup() {
   initBells();
 
   setupI2S();
-  Serial.println("Dual drone + reverb + fairy dust playing!");
+  Serial.println("Dual drone + reverb + fairy dust + binaural beats playing!");
 }
 
 void loop() {
@@ -346,21 +352,38 @@ void loop() {
       bellNextTime = SAMPLE_RATE * (15.0f + bellRandFloat() * 10.0f);
     }
 
-    float drone = renderLayer(layerA, bandMapA) + renderLayer(layerB, bandMapB);
+    float dryL = 0, dryR = 0;
+    renderLayerStereo(layerA, bandMapA, dryL, dryR);
+    renderLayerStereo(layerB, bandMapB, dryL, dryR);
     float chime = renderBells();
-    float dry = drone + chime;
-    float wet = processReverb(dry);
-    float mix = dry + wet * reverbMix;
+    dryL += chime;
+    dryR += chime;
 
-    // Soft clip with tanh-like curve
-    if (mix > 0.8f) mix = 0.8f + 0.2f * tanhf((mix - 0.8f) * 5.0f);
-    if (mix < -0.8f) mix = -0.8f + 0.2f * tanhf((mix + 0.8f) * 5.0f);
-    if (mix > 1.0f) mix = 1.0f;
-    if (mix < -1.0f) mix = -1.0f;
+    // Apply binaural beat: gentle amplitude modulation, opposite phase L vs R
+    // This creates the perceptual binaural beating in headphones
+    float bin = fastSin(binauralPhase) * 0.15f;  // subtle 15% modulation depth
+    binauralPhase += binauralFreq / SAMPLE_RATE;
+    if (binauralPhase >= 1.0f) binauralPhase -= 1.0f;
+    dryL *= (1.0f + bin);
+    dryR *= (1.0f - bin);
 
-    int16_t val = (int16_t)(mix * 10000.0f);
-    outBuf[s * 2] = val;
-    outBuf[s * 2 + 1] = val;
+    // Reverb on mono sum (saves CPU, reverb naturally blends stereo)
+    float wet = processReverb((dryL + dryR) * 0.5f);
+    float mixL = dryL + wet * reverbMix;
+    float mixR = dryR + wet * reverbMix;
+
+    // Soft clip both channels
+    if (mixL > 0.8f) mixL = 0.8f + 0.2f * tanhf((mixL - 0.8f) * 5.0f);
+    if (mixL < -0.8f) mixL = -0.8f + 0.2f * tanhf((mixL + 0.8f) * 5.0f);
+    if (mixL > 1.0f) mixL = 1.0f;
+    if (mixL < -1.0f) mixL = -1.0f;
+    if (mixR > 0.8f) mixR = 0.8f + 0.2f * tanhf((mixR - 0.8f) * 5.0f);
+    if (mixR < -0.8f) mixR = -0.8f + 0.2f * tanhf((mixR + 0.8f) * 5.0f);
+    if (mixR > 1.0f) mixR = 1.0f;
+    if (mixR < -1.0f) mixR = -1.0f;
+
+    outBuf[s * 2] = (int16_t)(mixL * 8000.0f);
+    outBuf[s * 2 + 1] = (int16_t)(mixR * 8000.0f);
   }
 
   unsigned long t1 = micros();
