@@ -138,6 +138,94 @@ const Scene scenesB[] = {
   {{0.4, 0.28, 0.14, 0.12, 0.04, 0.04, 0.01, 0.03}},
 };
 
+// === BELLS: Fairy dust chime layer ===
+#define MAX_BELLS 3       // polyphony (CPU friendly)
+#define BELL_PARTIALS 3   // pure DX7-style: fundamental + octave + fifth
+
+// Consonant bell pitches that work with A55Hz drone
+const float bellPitches[] = {440.0f, 554.37f, 659.26f, 880.0f, 1108.73f, 1318.51f};
+const int numBellPitches = 6;
+
+// Pure integer ratios — clean FM-style bell, no inharmonics
+const float bellPartialRatio[BELL_PARTIALS] = {1.0f, 2.0f, 3.0f};
+const float bellPartialAmp[BELL_PARTIALS]   = {1.0f, 0.4f, 0.15f};
+
+struct Bell {
+  bool active;
+  float phase[BELL_PARTIALS];
+  float freq;          // fundamental
+  float env;           // current envelope value
+  float decay;         // decay rate per sample (e.g. 0.99997)
+};
+
+Bell bells[MAX_BELLS];
+float bellVolume = 0.04f;  // very light fairy dust
+
+// Simple LFSR pseudo-random
+uint32_t bellRng = 12345;
+uint32_t bellRand() {
+  bellRng ^= bellRng << 13;
+  bellRng ^= bellRng >> 17;
+  bellRng ^= bellRng << 5;
+  return bellRng;
+}
+
+float bellRandFloat() {
+  return (float)(bellRand() & 0xFFFF) / 65536.0f;
+}
+
+// Trigger timing
+float bellTimer = 0;
+float bellNextTime = 0;  // samples until next bell
+
+void initBells() {
+  for (int i = 0; i < MAX_BELLS; i++) {
+    bells[i].active = false;
+  }
+  bellNextTime = SAMPLE_RATE * 15.0f;  // first bell after 15 seconds
+}
+
+void triggerBell() {
+  // Find a free voice
+  int slot = -1;
+  float quietest = 1.0f;
+  int quietSlot = 0;
+  for (int i = 0; i < MAX_BELLS; i++) {
+    if (!bells[i].active) { slot = i; break; }
+    if (bells[i].env < quietest) { quietest = bells[i].env; quietSlot = i; }
+  }
+  if (slot < 0) slot = quietSlot;  // steal quietest voice
+
+  Bell &b = bells[slot];
+  b.active = true;
+  b.freq = bellPitches[bellRand() % numBellPitches];
+  // Fixed long decay: ~12 second tail
+  float decaySec = 12.0f;
+  b.decay = powf(0.001f, 1.0f / (decaySec * SAMPLE_RATE));  // -60dB over decaySec
+  b.env = 0.7f + bellRandFloat() * 0.3f;  // slight random velocity
+  for (int p = 0; p < BELL_PARTIALS; p++) {
+    b.phase[p] = bellRandFloat() * 0.1f;  // slight random phase offset
+  }
+}
+
+float renderBells() {
+  float mix = 0;
+  for (int i = 0; i < MAX_BELLS; i++) {
+    if (!bells[i].active) continue;
+    Bell &b = bells[i];
+    float sig = 0;
+    for (int p = 0; p < BELL_PARTIALS; p++) {
+      sig += fastSin(b.phase[p]) * bellPartialAmp[p];
+      b.phase[p] += (b.freq * bellPartialRatio[p]) / SAMPLE_RATE;
+      if (b.phase[p] >= 1.0f) b.phase[p] -= 1.0f;
+    }
+    mix += sig * b.env;
+    b.env *= b.decay;
+    if (b.env < 0.0001f) b.active = false;  // voice done
+  }
+  return mix * bellVolume;
+}
+
 // === REVERB: 4 comb filters + 2 allpass filters ===
 // Prime-length delays to avoid metallic resonances
 #define NUM_COMBS 4
@@ -239,15 +327,28 @@ void setup() {
   memset(combBuf, 0, sizeof(combBuf));
   memset(apBuf, 0, sizeof(apBuf));
 
+  initBells();
+
   setupI2S();
-  Serial.println("Dual drone + reverb playing!");
+  Serial.println("Dual drone + reverb + fairy dust playing!");
 }
 
 void loop() {
   unsigned long t0 = micros();
 
   for (int s = 0; s < BUFFER_SIZE; s++) {
-    float dry = renderLayer(layerA, bandMapA) + renderLayer(layerB, bandMapB);
+    // Bell trigger check
+    bellTimer += 1.0f;
+    if (bellTimer >= bellNextTime) {
+      triggerBell();
+      bellTimer = 0;
+      // Next bell in 15-25 seconds (very sparse fairy dust)
+      bellNextTime = SAMPLE_RATE * (15.0f + bellRandFloat() * 10.0f);
+    }
+
+    float drone = renderLayer(layerA, bandMapA) + renderLayer(layerB, bandMapB);
+    float chime = renderBells();
+    float dry = drone + chime;
     float wet = processReverb(dry);
     float mix = dry + wet * reverbMix;
 
